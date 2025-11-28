@@ -388,6 +388,9 @@ download_release() {
         return 0
     fi
     
+    # Remove any existing partial download
+    rm -f "$tarfile"
+    
     local attempt=1
     while [[ $attempt -le $MAX_RETRIES ]]; do
         log_info "Download attempt $attempt/$MAX_RETRIES..."
@@ -406,7 +409,11 @@ download_release() {
                 return 0
             else
                 log_error "Downloaded file is empty or missing"
+                rm -f "$tarfile"
             fi
+        else
+            # Clean up failed download
+            rm -f "$tarfile"
         fi
         
         ((attempt++))
@@ -416,8 +423,51 @@ download_release() {
         fi
     done
     
+    # Ensure cleanup on final failure
+    rm -f "$tarfile"
     log_error "Download failed after $MAX_RETRIES attempts"
     return 1
+}
+
+verify_download() {
+    local tarfile="$1"
+    
+    log_info "Verifying downloaded file..."
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would verify: $tarfile"
+        return 0
+    fi
+    
+    # Check file exists
+    if ! [[ -f "$tarfile" ]]; then
+        log_error "Download file not found: $tarfile"
+        return 1
+    fi
+    
+    # Check file has content
+    if ! [[ -s "$tarfile" ]]; then
+        log_error "Download file is empty: $tarfile"
+        return 1
+    fi
+    
+    # Check minimum file size (should be at least 50MB for Sonatype IQ)
+    local filesize=$(stat -f%z "$tarfile" 2>/dev/null || stat -c%s "$tarfile" 2>/dev/null)
+    local min_size=$((50 * 1024 * 1024))  # 50MB in bytes
+    
+    if [[ $filesize -lt $min_size ]]; then
+        log_error "Download file is too small (${filesize} bytes). Expected at least ${min_size} bytes."
+        return 1
+    fi
+    
+    # Verify it's a valid gzip file
+    if ! gzip -t "$tarfile" 2>/dev/null; then
+        log_error "Download file is not a valid gzip archive"
+        return 1
+    fi
+    
+    log_success "Download verification passed. File size: $((filesize / 1024 / 1024))MB"
+    return 0
 }
 
 extract_release() {
@@ -502,24 +552,36 @@ perform_upgrade() {
     log_info "Current version: $current_version"
     log_info "Target version: 1.${VERSION}.0-01"
     
-    # Stop service
+    # Download new version FIRST (before any system changes)
+    log_info "Phase 1: Download and Validation (no system changes yet)"
+    local tarfile
+    if ! tarfile=$(download_release); then
+        log_error "Download failed. No system changes made."
+        exit 1
+    fi
+    
+    # Verify download completed successfully
+    if ! verify_download "$tarfile"; then
+        log_error "Download verification failed. Removing incomplete file."
+        rm -f "$tarfile"
+        exit 1
+    fi
+    
+    log_success "Download completed and verified. Proceeding with upgrade..."
+    log_info "Phase 2: System Upgrade (stopping service and applying changes)"
+    
+    # Now that we have the file, stop service
     if ! stop_service; then
-        log_error "Failed to stop service. Aborting upgrade."
+        log_error "Failed to stop service. Cleaning up download."
+        rm -f "$tarfile"
         exit 1
     fi
     
     # Create backup
     if ! create_backup; then
-        log_error "Backup failed. Aborting upgrade."
+        log_error "Backup failed. Attempting to restart service."
         start_service  # Try to restart with old version
-        exit 1
-    fi
-    
-    # Download new version
-    local tarfile
-    if ! tarfile=$(download_release); then
-        log_error "Download failed. Rolling back..."
-        rollback
+        rm -f "$tarfile"
         exit 1
     fi
     
